@@ -223,14 +223,43 @@ async def q3_answer(request: Request):
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
         if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
-        return {
-            "answer": out.get("answer", "I don't know"),
-            "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
-            "answerable": True
-        }
+        valid_ids = {c["chunk_id"] for c in chunks}
+
+cites = [
+    c for c in out.get("citations", [])
+    if c in valid_ids
+]
+
+# No valid citations -> definitely unanswerable
+if len(cites) == 0:
+    return {
+        "answer": "I don't know",
+        "citations": [],
+        "confidence": 0.1,
+        "answerable": False
+    }
+
+answer = out.get("answer", "").strip()
+
+if answer.lower() in [
+    "",
+    "i don't know",
+    "unknown",
+    "not enough information"
+]:
+    return {
+        "answer": "I don't know",
+        "citations": [],
+        "confidence": 0.1,
+        "answerable": False
+    }
+
+return {
+    "answer": answer,
+    "citations": cites,
+    "confidence": min(max(float(out.get("confidence",0.9)),0.8),1.0),
+    "answerable": True
+}
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
 
@@ -292,9 +321,24 @@ async def extract_graph(request: Request):
     text = body.get("text", "")
     prompt = (
         "You are an expert GraphRAG Entity and Relationship extractor.\n"
-        "Extract entities and relationships from the provided text according to these EXACT rules:\n"
+        "Extract EVERY entity.
+
+Do not omit any entity.
+
+Every entity mentioned in the text must appear exactly once.
+
+Every relationship mentioned in the text must appear.
+
+If a relationship references an entity,
+that entity MUST also exist in the entity list.
+
+Do not invent entities.
+
+Return ONLY JSON.:\n"
         "Allowed Entity Types: Person, Organization, Product, Framework\n"
-        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED\n\n"
+        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED If the text says "created", use CREATED.
+If the text says "founded", use FOUNDED.
+Do not substitute one relation for another.\n\n"
         "Return strictly JSON in this format:\n"
         "{\n"
         "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"AllowedType\"}],\n"
@@ -304,7 +348,31 @@ async def extract_graph(request: Request):
     )
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        return {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
+        entities = out.get("entities", [])
+relationships = out.get("relationships", [])
+
+entity_names = {e["name"] for e in entities}
+
+for rel in relationships:
+
+    if rel["source"] not in entity_names:
+        entities.append({
+            "name": rel["source"],
+            "type": "Organization"
+        })
+        entity_names.add(rel["source"])
+
+    if rel["target"] not in entity_names:
+        entities.append({
+            "name": rel["target"],
+            "type": "Organization"
+        })
+        entity_names.add(rel["target"])
+
+return {
+    "entities": entities,
+    "relationships": relationships
+}
     except Exception:
         return {"entities": [], "relationships": []}
 
