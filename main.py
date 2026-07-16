@@ -159,7 +159,7 @@ def _ck(*parts):
     return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
 
 import asyncio
-async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
+async def chat(messages, model=None, max_tokens=800, force_json=True, retries=3):
     key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
     if key in _CACHE:
         return _CACHE[key]
@@ -168,13 +168,13 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
     if force_json:
         body["response_format"] = {"type": "json_object"}
     last_err = None
-    async with httpx.AsyncClient(timeout=90) as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         for attempt in range(retries):
             r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
                              headers=HEAD, json=body)
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}: {r.text[:160]}"
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(0.8 * (attempt + 1))
                 continue
             r.raise_for_status()
             out = r.json()["choices"][0]["message"]["content"]
@@ -196,7 +196,7 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 
-# ================= Q3: /q3/answer =================
+# ================= Q3: /grounded-answer =================
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
     body = await request.json()
@@ -220,46 +220,27 @@ async def q3_answer(request: Request):
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=800))
+
         if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
         valid_ids = {c["chunk_id"] for c in chunks}
+        cites = [c for c in out.get("citations", []) if c in valid_ids]
 
-cites = [
-    c for c in out.get("citations", [])
-    if c in valid_ids
-]
+        if len(cites) == 0:
+            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
 
-# No valid citations -> definitely unanswerable
-if len(cites) == 0:
-    return {
-        "answer": "I don't know",
-        "citations": [],
-        "confidence": 0.1,
-        "answerable": False
-    }
+        answer = str(out.get("answer", "")).strip()
+        if answer.lower() in ["", "i don't know", "unknown", "not enough information"]:
+            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
 
-answer = out.get("answer", "").strip()
-
-if answer.lower() in [
-    "",
-    "i don't know",
-    "unknown",
-    "not enough information"
-]:
-    return {
-        "answer": "I don't know",
-        "citations": [],
-        "confidence": 0.1,
-        "answerable": False
-    }
-
-return {
-    "answer": answer,
-    "citations": cites,
-    "confidence": min(max(float(out.get("confidence",0.9)),0.8),1.0),
-    "answerable": True
-}
+        return {
+            "answer": answer,
+            "citations": cites,
+            "confidence": min(max(float(out.get("confidence", 0.9)), 0.8), 1.0),
+            "answerable": True
+        }
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
 
@@ -279,7 +260,6 @@ async def vector_search(request: Request):
     top_k = body.get("top_k", 10)
     rerank_top_n = body.get("rerank_top_n", 3)
     filters = body.get("filter", {})
-    # 1. Filter documents
     filtered_docs = []
     for doc in Q4_DOCS:
         match = True
@@ -296,7 +276,6 @@ async def vector_search(request: Request):
                     match = False
         if match:
             filtered_docs.append(doc)
-    # 2. Cosine similarity
     scored_docs = []
     for doc in filtered_docs:
         doc_id = doc["doc_id"]
@@ -304,10 +283,8 @@ async def vector_search(request: Request):
         if doc_emb is not None:
             sim = cosine_sim(query_vector, doc_emb)
             scored_docs.append({"doc_id": doc_id, "sim": sim})
-    # 3. Top-k (desc sim, tie-break lexicographic)
     scored_docs.sort(key=lambda x: (-x["sim"], x["doc_id"]))
     top_k_docs = scored_docs[:top_k]
-    # 4. Re-rank
     rerank_scores = Q4_RERANKER.get(query_id, {})
     for doc in top_k_docs:
         doc["rerank_score"] = rerank_scores.get(doc["doc_id"], -999.0)
@@ -321,24 +298,15 @@ async def extract_graph(request: Request):
     text = body.get("text", "")
     prompt = (
         "You are an expert GraphRAG Entity and Relationship extractor.\n"
-        "Extract EVERY entity.
-
-Do not omit any entity.
-
-Every entity mentioned in the text must appear exactly once.
-
-Every relationship mentioned in the text must appear.
-
-If a relationship references an entity,
-that entity MUST also exist in the entity list.
-
-Do not invent entities.
-
-Return ONLY JSON.:\n"
+        "Extract every entity and relationship mentioned in the text.\n"
         "Allowed Entity Types: Person, Organization, Product, Framework\n"
-        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED If the text says "created", use CREATED.
-If the text says "founded", use FOUNDED.
-Do not substitute one relation for another.\n\n"
+        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED\n"
+        "Rules:\n"
+        "- Every entity mentioned in the text must appear exactly once in the entities list.\n"
+        "- Every entity referenced by a relationship must also exist in the entities list.\n"
+        "- Do not invent entities that are not mentioned in the text.\n"
+        "- Map synonyms to the closest allowed relationship type (e.g. 'created' or 'founded' maps to FOUNDED; 'built' or 'made' maps to DEVELOPED).\n"
+        "- Return ONLY strict JSON, no extra commentary.\n\n"
         "Return strictly JSON in this format:\n"
         "{\n"
         "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"AllowedType\"}],\n"
@@ -349,30 +317,20 @@ Do not substitute one relation for another.\n\n"
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
         entities = out.get("entities", [])
-relationships = out.get("relationships", [])
+        relationships = out.get("relationships", [])
 
-entity_names = {e["name"] for e in entities}
+        entity_names = {e["name"] for e in entities}
+        for rel in relationships:
+            src = rel.get("source")
+            tgt = rel.get("target")
+            if src and src not in entity_names:
+                entities.append({"name": src, "type": "Organization"})
+                entity_names.add(src)
+            if tgt and tgt not in entity_names:
+                entities.append({"name": tgt, "type": "Organization"})
+                entity_names.add(tgt)
 
-for rel in relationships:
-
-    if rel["source"] not in entity_names:
-        entities.append({
-            "name": rel["source"],
-            "type": "Organization"
-        })
-        entity_names.add(rel["source"])
-
-    if rel["target"] not in entity_names:
-        entities.append({
-            "name": rel["target"],
-            "type": "Organization"
-        })
-        entity_names.add(rel["target"])
-
-return {
-    "entities": entities,
-    "relationships": relationships
-}
+        return {"entities": entities, "relationships": relationships}
     except Exception:
         return {"entities": [], "relationships": []}
 
